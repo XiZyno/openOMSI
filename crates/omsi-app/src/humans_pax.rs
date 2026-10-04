@@ -854,7 +854,8 @@ impl Humans {
 
     /// sub_7e910c: a free place of the bus, at random (none free: nobody gets on). `off`:
     /// the places its scripts have switched off (#721), which nobody takes.
-    pub(super) fn reserve_place(&mut self, bus: BusId, n: usize, off: &[bool]) -> Option<usize> {
+    pub(super) fn reserve_place(&mut self, bus: BusId, cabin: &Cabin, off: &[bool], prefer_seat: bool) -> Option<usize> {
+        let n = cabin.seats.len();
         let seats = self.seats.entry(bus).or_insert_with(|| vec![false; n]);
         if seats.len() < n {
             seats.resize(n, false);
@@ -863,42 +864,21 @@ impl Humans {
         if free.is_empty() {
             return None;
         }
-        let k = free[(self.rand() as usize) % free.len()];
-        self.seats.get_mut(&bus).unwrap()[k] = true;
-        Some(k)
-    }
 
-    /// Reserves a place for a passenger, preferring a seat and falling back to standing when necessary.
-    pub(super) fn reserve_pax_place(
-        &mut self,
-        bus: BusId,
-        cabin: &Cabin,
-        off: &[bool],
-    ) -> Option<usize> {
-        let n = cabin.seats.len();
-        let seats = self.seats.entry(bus).or_insert_with(|| vec![false; n]);
-        if seats.len() < n {
-            seats.resize(n, false);
-        }
+        let candidates: Vec<usize> = if prefer_seat {
+            let preferred: Vec<usize> = free
+                .iter()
+                .copied()
+                .filter(|k| cabin.seats[*k].seated)
+                .collect();
 
-        let free: Vec<usize> = (0..n)
-            .filter(|k| !seats[*k] && !off.get(*k).copied().unwrap_or(false))
-            .collect();
-
-        if free.is_empty() {
-            return None;
-        }
-
-        let preferred: Vec<usize> = free
-            .iter()
-            .copied()
-            .filter(|k| cabin.seats[*k].seated)
-            .collect();
-
-        let candidates = if preferred.is_empty() {
-            &free
+            if preferred.is_empty() {
+                free
+            } else {
+                preferred
+            }
         } else {
-            &preferred
+            free
         };
 
         let k = candidates[(self.rand() as usize) % candidates.len()];
@@ -1763,7 +1743,7 @@ impl Humans {
                 let Some(stop) = p.stop else { return };
                 if let Some(bn) = bn {
                     if bn.speed.abs() < 3.0 && self.in_stop_box(stop, bn.id) {
-                        if let Some(k) = self.reserve_pax_place(bn.id, &bn.cabin, &bn.places_off) {
+                        if let Some(k) = self.reserve_place(bn.id, &bn.cabin, &bn.places_off, true) {
                             let (tk, id) = self.decide_pax_ticket(i, bn);
                             let price = self.tickets.as_ref().and_then(|t| t.tickets.get(id.saturating_sub(1) as usize)).map(|t| t.value).unwrap_or(0.0);
                             let pp = self.pax_mut(i).unwrap();

@@ -3634,7 +3634,7 @@ impl Humans {
         let rot = bus.body_rotation();
         let off = places_off(bus, &cabin);
         for _ in 0..n {
-            let Some(k) = self.reserve_place(BusId::Player, cabin.seats.len(), &off) else { break };
+            let Some(k) = self.reserve_place(BusId::Player, &cabin, &off, false) else { break };
             let walk = 1.1 + (self.rand_f() as f32 * 2.0 - 1.0) * 0.2;
             let r = self.rand_f() as f32;
             let mut pax = Pax::new(walk, self.rand_f());
@@ -6367,11 +6367,11 @@ mod tests {
         assert_eq!(off, [true, false, false, false], "only the place whose variable is 0 is off");
         let mut h = Humans::new(Path::new("/nonexistent"));
         for _ in 0..40 {
-            let k = h.reserve_place(BusId::Player, 4, &off).expect("a free place");
+            let k = h.reserve_place(BusId::Player, &cabin, &off, false).expect("a free place");
             assert_ne!(k, 0, "nobody takes a place that is switched off");
             h.free_seat(BusId::Player, k);
         }
-        assert_eq!(h.reserve_place(BusId::Player, 4, &[true; 4]), None, "all off: nobody gets on");
+        assert_eq!(h.reserve_place(BusId::Player, &cabin, &[true; 4], false), None, "all off: nobody gets on");
         v.set_var("layout_long", 1.0);
         assert_eq!(places_off(&v, &cabin), [false; 4]);
         // somebody sits on the tip-up seat (place 1) of this bus, somebody on place 1 of another
