@@ -868,44 +868,6 @@ impl Humans {
         Some(k)
     }
 
-    /// Reserves a place for a passenger, preferring a seat and falling back to standing when necessary.
-    pub(super) fn reserve_pax_place(
-        &mut self,
-        bus: BusId,
-        cabin: &Cabin,
-        off: &[bool],
-    ) -> Option<usize> {
-        let n = cabin.seats.len();
-        let seats = self.seats.entry(bus).or_insert_with(|| vec![false; n]);
-        if seats.len() < n {
-            seats.resize(n, false);
-        }
-
-        let free: Vec<usize> = (0..n)
-            .filter(|k| !seats[*k] && !off.get(*k).copied().unwrap_or(false))
-            .collect();
-
-        if free.is_empty() {
-            return None;
-        }
-
-        let preferred: Vec<usize> = free
-            .iter()
-            .copied()
-            .filter(|k| cabin.seats[*k].seated)
-            .collect();
-
-        let candidates = if preferred.is_empty() {
-            &free
-        } else {
-            &preferred
-        };
-
-        let k = candidates[(self.rand() as usize) % candidates.len()];
-        self.seats.get_mut(&bus).unwrap()[k] = true;
-        Some(k)
-    }
-
     /// sub_5ce4e0: stamp (stamper_prop) or buy (ticketbuy_prop) at a bus that has a
     /// validator / a cash desk, else nothing to do; the ticket bought (sub_5ce2dc).
     pub(super) fn decide_pax_ticket(&mut self, i: usize, bn: &BusNow) -> (u8, u8) {
@@ -1763,7 +1725,7 @@ impl Humans {
                 let Some(stop) = p.stop else { return };
                 if let Some(bn) = bn {
                     if bn.speed.abs() < 3.0 && self.in_stop_box(stop, bn.id) {
-                        if let Some(k) = self.reserve_pax_place(bn.id, &bn.cabin, &bn.places_off) {
+                        if let Some(k) = self.reserve_place(bn.id, bn.cabin.seats.len(), &bn.places_off) {
                             let (tk, id) = self.decide_pax_ticket(i, bn);
                             let price = self.tickets.as_ref().and_then(|t| t.tickets.get(id.saturating_sub(1) as usize)).map(|t| t.value).unwrap_or(0.0);
                             let pp = self.pax_mut(i).unwrap();
