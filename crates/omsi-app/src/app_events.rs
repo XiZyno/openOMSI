@@ -1299,8 +1299,16 @@ impl ApplicationHandler for App {
                             log::info!("people: {} bus stops with timetable targets", t.len());
                         }
                     }
+                    let duty_stop_distances = self
+                        .duty
+                        .as_ref()
+                        .zip(self.schedule.as_ref())
+                        .zip(self.traffic.as_ref())
+                        .map(|((duty, schedule), traffic)| {
+                            schedule.trip_stop_distances(&traffic.net, duty.trip())
+                        });
                     // (whom the player's bus takes on: nobody waiting in free drive)
-                    h.set_duty(self.duty.as_ref());
+                    h.set_duty(self.duty.as_ref(), duty_stop_distances);
                     // (the riders leave a bus the driver has walked away from)
                     h.driver_away = self.on_foot.as_ref().is_some_and(|f| {
                         let own = Some(crate::humans::BusId::Player);

@@ -1572,6 +1572,40 @@ impl Schedule {
         out.into_iter().filter_map(|s| if let Slot::Lane(l) = s { Some(l) } else { None }).collect()
     }
 
+    /// Cumulative distance of each stop along a trip's route.
+    /// Stops that have no position or cannot be projected onto the route are `None`.
+    pub fn trip_stop_distances(
+        &self,
+        net: &omsi_sim::traffic::Network,
+        trip: &PlannedTrip,
+    ) -> Vec<Option<f64>> {
+        let route = self.trip_route_in(net, &trip.name);
+        if route.is_empty() {
+            return vec![None; trip.stops.len()];
+        }
+
+        let mut route_start = Vec::with_capacity(route.len());
+        let mut total = 0.0;
+        for &lane in &route {
+            route_start.push(total);
+            total += net.lanes[lane].length() as f64;
+        }
+
+        trip.stops
+            .iter()
+            .map(|stop| {
+                let pos = stop.position?;
+                let (ri, s) = route.iter().enumerate().find_map(|(ri, &lane)| {
+                    net.lanes[lane]
+                        .nearest_point(pos)
+                        .filter(|(_, d)| *d < 25.0)
+                        .map(|(s, _)| (ri, s))
+                })?;
+
+                Some(route_start[ri] + s as f64)
+            })
+            .collect()
+    }
     /// `OMSI_CHECK_TRIPS=1`: build the route of every trip on the loaded lanes and say where
     /// consecutive lanes do not join - a gap the bus would jump, or a lane taken the wrong
     /// way round (its end, not its start, lies where the lane before ends), which sends a

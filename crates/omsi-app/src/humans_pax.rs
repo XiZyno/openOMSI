@@ -556,8 +556,36 @@ pub(super) fn fit(id: i64, stop: &PaxStop, dest: Option<&str>, termini: &HashSet
         let (sid, name, stops) = &trip.stops[*k];
         *stops && (*sid == id || stop.is_named(name))
     })?;
-    trip.stops[here + 1..].iter().any(|(_, name, stops)| *stops && name.trim() == dest).then_some(Fit::Duty)
+        trip.stops[here + 1..]
+        .iter()
+        .any(|(_, name, stops)| *stops && name.trim() == dest)
+        .then_some(Fit::Duty)
 }
+
+    /// Planned distance between a passenger's boarding stop and destination on the player's trip.
+    fn duty_ride_distance(
+        stop: i64,
+        dest: &str,
+        trip: &DutyTrip,
+        distances: &[Option<f64>],
+    ) -> Option<f64> {
+        let from = trip
+            .stops
+            .iter()
+            .position(|(id, _, stops)| *stops && *id == stop)?;
+    
+        let to = trip.stops[from + 1..]
+            .iter()
+            .enumerate()
+            .find_map(|(offset, (_, name, stops))| {
+                (*stops && name.trim() == dest.trim()).then_some(from + 1 + offset)
+            })?;
+        
+        let from_distance = distances.get(from).copied().flatten()?;
+        let to_distance = distances.get(to).copied().flatten()?;
+        
+        Some((to_distance - from_distance).max(0.0))
+    }
 
 /// A point of the cabin's path network with its links in the file's order: the point at
 /// the other end, the points reached through it (sub_72410c), the link's index, its room
@@ -865,21 +893,17 @@ impl Humans {
             return None;
         }
 
-        let candidates: Vec<usize> = if prefer_seat {
-            let preferred: Vec<usize> = free
-                .iter()
-                .copied()
-                .filter(|k| cabin.seats[*k].seated)
-                .collect();
-
-            if preferred.is_empty() {
+        let preferred: Vec<usize> = free
+            .iter()
+            .copied()
+            .filter(|k| cabin.seats[*k].seated == prefer_seat)
+            .collect();
+            
+        let candidates = if preferred.is_empty() {
                 free
             } else {
                 preferred
-            }
-        } else {
-            free
-        };
+            };
 
         let k = candidates[(self.rand() as usize) % candidates.len()];
         self.seats.get_mut(&bus).unwrap()[k] = true;
@@ -1743,7 +1767,34 @@ impl Humans {
                 let Some(stop) = p.stop else { return };
                 if let Some(bn) = bn {
                     if bn.speed.abs() < 3.0 && self.in_stop_box(stop, bn.id) {
-                        if let Some(k) = self.reserve_place(bn.id, &bn.cabin, &bn.places_off, true) {
+                        let prefer_seat = if bn.id != BusId::Player {
+                            true
+                        } else {
+                            let short_ride = match (
+                                self.duty.as_ref(),
+                                self.duty_stop_distances.as_deref(),
+                                p.dest.as_deref(),
+                            ) {
+                                (Some((trip, _, false)), Some(distances), Some(dest)) => {
+                                    duty_ride_distance(stop, dest, trip, distances)
+                                        .is_some_and(|distance| distance < 1000.0)
+                                }
+                                _ => false,
+                            };
+
+                            if short_ride {
+                                (self.rand_f() as f32) < 0.3
+                            } else {
+                                true
+                            }
+                        };
+
+                        if let Some(k) = self.reserve_place(
+                            bn.id,
+                            &bn.cabin,
+                            &bn.places_off,
+                            prefer_seat
+                        ) {
                             let (tk, id) = self.decide_pax_ticket(i, bn);
                             let price = self.tickets.as_ref().and_then(|t| t.tickets.get(id.saturating_sub(1) as usize)).map(|t| t.value).unwrap_or(0.0);
                             let pp = self.pax_mut(i).unwrap();

@@ -1617,6 +1617,8 @@ pub struct Humans {
     /// whether the trip has reached its last stop. None: free drive, and nobody waiting
     /// boards the player's bus.
     duty: Option<(Arc<DutyTrip>, usize, bool)>,
+    /// Cumulative stop distances along the player's current planned trip.
+    duty_stop_distances: Option<Vec<Option<f64>>>,
     /// Buses whose validator somebody used since the app last looked (`take_stamped`).
     stamped: Vec<BusId>,
     /// Pedestrians to keep strolling near the player (scaled by `density`).
@@ -1854,6 +1856,7 @@ impl Humans {
             stop_targets: None,
             stop_names: None,
             duty: None,
+            duty_stop_distances: None,
             stamped: Vec::new(),
             pedestrians: 14,
             max_people: crate::settings::Settings::load().ai_max_humans.max(1) as usize,
@@ -3367,9 +3370,10 @@ impl Humans {
 
     /// The player's duty this frame; None in free drive, where the people waiting leave the
     /// player's bus alone. (Set after `stop_names`: the trip's stops are named by it.)
-    pub fn set_duty(&mut self, duty: Option<&crate::schedule::PlayerDuty>) {
+    pub fn set_duty(&mut self, duty: Option<&crate::schedule::PlayerDuty>, duty_stop_distances: Option<Vec<Option<f64>>>) {
         let Some(d) = duty else {
             self.duty = None;
+            self.duty_stop_distances = None;
             return;
         };
         // the trip the IBIS is given: on a works trip from the depot the next one with a line
@@ -3380,6 +3384,7 @@ impl Humans {
             _ => Arc::new(DutyTrip::of(t, self.stop_names.as_ref())),
         };
         self.duty = Some((trip, next, done));
+        self.duty_stop_distances = duty_stop_distances;
     }
 
     /// Is `bus` among the buses people can be in this frame (an AI bus, or another player's)?

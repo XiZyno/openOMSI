@@ -994,7 +994,15 @@ pub(crate) fn run_offscreen(
             };
             h.eye = Some(humans::Eye::of(&eye_cam, view_aspect).widened(triple_extent(&settings, &eye_cam, size.0, size.1)));
             h.set_remote_buses(remotes_off.remotes.iter().map(|(id, r)| (*id, r.vehicle())));
-            h.set_duty(duty.as_ref());
+            let duty_stop_distances = duty
+                .as_ref()
+                .zip(schedule.as_ref())
+                .zip(traffic.as_ref())
+                .map(|((duty, schedule), traffic)| {
+                    schedule.trip_stop_distances(&traffic.net, duty.trip())
+                });
+
+            h.set_duty(duty.as_ref(), duty_stop_distances);
             h.set_player_next_stop(duty.as_ref().and_then(|d| d.trip().stops.get(d.next_stop)));
             let took = h.tick(
                 dt,
