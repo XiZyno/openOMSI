@@ -3370,7 +3370,12 @@ impl Humans {
 
     /// The player's duty this frame; None in free drive, where the people waiting leave the
     /// player's bus alone. (Set after `stop_names`: the trip's stops are named by it.)
-    pub fn set_duty(&mut self, duty: Option<&crate::schedule::PlayerDuty>, duty_stop_distances: Option<Vec<Option<f64>>>) {
+    pub fn set_duty(
+        &mut self,
+        duty: Option<&crate::schedule::PlayerDuty>,
+        schedule: Option<&crate::schedule::Schedule>,
+        network: Option<&omsi_sim::traffic::Network>,
+    ) {
         let Some(d) = duty else {
             self.duty = None;
             self.duty_stop_distances = None;
@@ -3379,12 +3384,19 @@ impl Humans {
         // the trip the IBIS is given: on a works trip from the depot the next one with a line
         let (t, next) = d.trip_for_ibis();
         let done = std::ptr::eq(t, d.trip()) && d.trip_done();
+        let same_trip = self.duty.as_ref().is_some_and(|(trip, ..)| {
+            trip.name == t.name && trip.departure == t.departure
+        });
         let trip = match self.duty.take() {
             Some((trip, ..)) if trip.name == t.name && trip.departure == t.departure => trip,
             _ => Arc::new(DutyTrip::of(t, self.stop_names.as_ref())),
         };
+        if !same_trip {
+            self.duty_stop_distances = schedule
+                .zip(network)
+                .map(|(schedule, network)| schedule.trip_stop_distances(network, t));
+        }
         self.duty = Some((trip, next, done));
-        self.duty_stop_distances = duty_stop_distances;
     }
 
     /// Is `bus` among the buses people can be in this frame (an AI bus, or another player's)?
@@ -3639,7 +3651,7 @@ impl Humans {
         let rot = bus.body_rotation();
         let off = places_off(bus, &cabin);
         for _ in 0..n {
-            let Some(k) = self.reserve_place(BusId::Player, &cabin, &off, false) else { break };
+            let Some(k) = self.reserve_place(BusId::Player, &cabin, &off, Some(true)) else { break };
             let walk = 1.1 + (self.rand_f() as f32 * 2.0 - 1.0) * 0.2;
             let r = self.rand_f() as f32;
             let mut pax = Pax::new(walk, self.rand_f());
@@ -6372,11 +6384,11 @@ mod tests {
         assert_eq!(off, [true, false, false, false], "only the place whose variable is 0 is off");
         let mut h = Humans::new(Path::new("/nonexistent"));
         for _ in 0..40 {
-            let k = h.reserve_place(BusId::Player, &cabin, &off, false).expect("a free place");
+            let k = h.reserve_place(BusId::Player, &cabin, &off, Some(false)).expect("a free place");
             assert_ne!(k, 0, "nobody takes a place that is switched off");
             h.free_seat(BusId::Player, k);
         }
-        assert_eq!(h.reserve_place(BusId::Player, &cabin, &[true; 4], false), None, "all off: nobody gets on");
+        assert_eq!(h.reserve_place(BusId::Player, &cabin, &[true; 4], Some(false)), None, "all off: nobody gets on");
         v.set_var("layout_long", 1.0);
         assert_eq!(places_off(&v, &cabin), [false; 4]);
         // somebody sits on the tip-up seat (place 1) of this bus, somebody on place 1 of another

@@ -565,6 +565,7 @@ pub(super) fn fit(id: i64, stop: &PaxStop, dest: Option<&str>, termini: &HashSet
     /// Planned distance between a passenger's boarding stop and destination on the player's trip.
     fn duty_ride_distance(
         stop: i64,
+        stop_info: &PaxStop,
         dest: &str,
         trip: &DutyTrip,
         distances: &[Option<f64>],
@@ -572,7 +573,7 @@ pub(super) fn fit(id: i64, stop: &PaxStop, dest: Option<&str>, termini: &HashSet
         let from = trip
             .stops
             .iter()
-            .position(|(id, _, stops)| *stops && *id == stop)?;
+            .position(|(id, name, stops)| *stops && (*id == stop || stop_info.is_named(name)))?;
     
         let to = trip.stops[from + 1..]
             .iter()
@@ -770,6 +771,24 @@ fn yaw_of(d: DVec2) -> f64 {
     d.x.atan2(d.y)
 }
 
+fn choose_place(free: &[usize], seats: &[Seat], prefer_seat: Option<bool>, pick: usize) -> usize {
+    let preferred: Vec<usize> = match prefer_seat {
+        Some(prefer_seat) => free
+                .iter()
+                .copied()
+                .filter(|k| seats[*k].seated == prefer_seat)
+                .collect(),
+            None => Vec::new(),
+    };
+    let candidates = if preferred.is_empty() {
+        free
+    } else {
+        &preferred
+    };
+
+    candidates[pick % candidates.len()]
+}
+
 impl Humans {
     /// The passenger of person `i`, if it is one.
     pub(super) fn pax(&self, i: usize) -> Option<&Pax> {
@@ -882,7 +901,7 @@ impl Humans {
 
     /// sub_7e910c: a free place of the bus, at random (none free: nobody gets on). `off`:
     /// the places its scripts have switched off (#721), which nobody takes.
-    pub(super) fn reserve_place(&mut self, bus: BusId, cabin: &Cabin, off: &[bool], prefer_seat: bool) -> Option<usize> {
+    pub(super) fn reserve_place(&mut self, bus: BusId, cabin: &Cabin, off: &[bool], prefer_seat: Option<bool>) -> Option<usize> {
         let n = cabin.seats.len();
         let seats = self.seats.entry(bus).or_insert_with(|| vec![false; n]);
         if seats.len() < n {
@@ -892,20 +911,7 @@ impl Humans {
         if free.is_empty() {
             return None;
         }
-
-        let preferred: Vec<usize> = free
-            .iter()
-            .copied()
-            .filter(|k| cabin.seats[*k].seated == prefer_seat)
-            .collect();
-            
-        let candidates = if preferred.is_empty() {
-                free
-            } else {
-                preferred
-            };
-
-        let k = candidates[(self.rand() as usize) % candidates.len()];
+        let k = choose_place(&free, &cabin.seats, prefer_seat, self.rand() as usize);
         self.seats.get_mut(&bus).unwrap()[k] = true;
         Some(k)
     }
@@ -1765,10 +1771,11 @@ impl Humans {
             }
             Task::ToBus => {
                 let Some(stop) = p.stop else { return };
+                let Some(stop_info) = self.stops.get(&stop) else { return };
                 if let Some(bn) = bn {
                     if bn.speed.abs() < 3.0 && self.in_stop_box(stop, bn.id) {
                         let prefer_seat = if bn.id != BusId::Player {
-                            true
+                            None
                         } else {
                             let short_ride = match (
                                 self.duty.as_ref(),
@@ -1776,16 +1783,16 @@ impl Humans {
                                 p.dest.as_deref(),
                             ) {
                                 (Some((trip, _, false)), Some(distances), Some(dest)) => {
-                                    duty_ride_distance(stop, dest, trip, distances)
+                                    duty_ride_distance(stop, stop_info, dest, trip, distances)
                                         .is_some_and(|distance| distance < 1000.0)
                                 }
                                 _ => false,
                             };
 
                             if short_ride {
-                                (self.rand_f() as f32) < 0.3
+                                Some((self.rand_f() as f32) < 0.3)
                             } else {
-                                true
+                                Some(true)
                             }
                         };
 
@@ -2808,5 +2815,39 @@ mod tests {
         assert_eq!(next(2, 0), Some(1).or(Some(0)).filter(|_| true).and(next(2, 0)));
         assert_eq!(next(1, 0), Some(0));
         assert_eq!(next(1, 2), Some(2));
+    }
+
+    #[test]
+    fn preferred_seat_falls_back_to_standing_place() {
+        let seats = vec![
+            Seat {
+                pos: Vec3::ZERO,
+                floor: Vec3::ZERO,
+                rot: 0.0,
+                seated: true,
+                height: 0.4,
+                omsi_seat: 0,
+                switch_var: None,
+                taken_var: None,
+                group: 0
+            },
+            Seat {
+                pos: Vec3::ZERO,
+                floor: Vec3::ZERO,
+                rot: 0.0,
+                seated: false,
+                height: 0.0,
+                omsi_seat: 1,
+                switch_var: None,
+                taken_var: None,
+                group: 0
+            }
+        ];
+        let free = [0, 1];
+        // With both types available, a passenger who prefers sitting gets the seat.
+        assert_eq!(choose_place(&free, &seats, Some(true), 0), 0);
+        // Once the seat is taken, the same preference falls back to the standing place.
+        let free = [1];
+        assert_eq!(choose_place(&free, &seats, Some(true), 0), 1);
     }
 }
