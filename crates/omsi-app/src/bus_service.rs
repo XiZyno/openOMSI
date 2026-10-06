@@ -121,6 +121,20 @@ fn early_wait(depart: f64, now: f64, layover: bool, rail: bool) -> f64 {
     };
     (depart - lead - now).clamp(0.0, LAYOVER_WAIT)
 }
+
+fn departure_wait(
+    depart: f64,
+    now: f64,
+    layover: bool,
+    terminal: bool,
+    rail: bool,
+) -> f64 {
+    if layover || terminal {
+        early_wait(depart, now, layover, rail)
+    } else {
+        0.0
+    }
+}
 /// On a layover, the doors open this long before the departure.
 const LAYOVER_BOARDING: f64 = 45.0;
 /// Pull into the bay over this distance before the stop: the stop's docking distance,
@@ -264,7 +278,8 @@ impl BusService {
         }
         let layover = std::mem::take(&mut self.layover);
         let rail = ctx.net.lanes.get(at.0).is_some_and(|l| l.kind == LaneKind::Rail);
-        let wait = early_wait(depart, ctx.day_time, layover, rail);
+        let terminal = self.last_stop == self.stops.front().map(|s| s.id);
+        let wait = departure_wait(depart, ctx.day_time, layover, terminal, rail);
         self.leave_at = ctx.day_time + wait;
         self.boarding = boarding_time(ctx.id);
         self.boarded = false;
@@ -576,5 +591,29 @@ mod tests {
         s.phase = Phase::Boarding;
         s.stops.clear();
         assert_eq!(s.at_station_side(), 0.0);
+    }
+
+    #[test]
+    fn ordinary_stop_does_not_wait_for_departure() {
+        assert_eq!(
+            departure_wait(400.0, 100.0, false, false, false),
+            0.0
+        );
+    }
+
+    #[test]
+    fn terminal_waits_for_departure() {
+        assert_eq!(
+            departure_wait(400.0, 100.0, false, true, false),
+            280.0
+        );
+    }
+
+    #[test]
+    fn layover_waits_until_departure() {
+        assert_eq!(
+            departure_wait(400.0, 100.0, true, false, false),
+            300.0
+        );
     }
 }
