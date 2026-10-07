@@ -22,6 +22,13 @@ struct Camera {
     flags: vec4<f32>,        // x detail texturing, y enhanced graphics, z never set (see fs_main's end), w close cascade half range
     light_view_proj_close: mat4x4<f32>,
     wind: vec4<f32>,         // the player's vehicle's velocity (m/s, world): the airstream on its glass
+    // Enhanced: the street lamps' shadow maps (the tiles under the far map), and the
+    // lights they belong to (-1: none)
+    lamp_view_proj: array<mat4x4<f32>, 4>,
+    lamp_shadow: vec4<f32>,
+    // Windy trees: xy the weather's wind (m/s, world; 0 with the setting off), zw how far
+    // the air has carried the gusts since the start (m, modulo PATTERN_PERIOD)
+    tree_wind: vec4<f32>,
 };
 
 // 1 when the point lies inside the player's vehicle (its [boundingbox], shrunk a little so
@@ -194,12 +201,52 @@ override ALPHA_TO_COVERAGE: bool = false;
 @group(0) @binding(8) var t_ao: texture_2d<f32>;
 @group(0) @binding(9) var s_ao: sampler;
 
+// Enhanced+: the traced lighting at a pixel (rt.wgsl, full size; camera.clouds.w 2): x the
+// ambient occlusion, z the sun's visibility (< 0 where it was not traced), w 1 where the
+// texel lies at this surface's depth (the pixel's own or a neighbour's; 0: the surface is
+// not in the depth prepass - a pane, a blended layer - and the shadow map stands in).
+fn rt_at(frag: vec2<f32>, world: vec3<f32>) -> vec4<f32> {
+    if (camera.clouds.w < 1.5) {
+        return vec4<f32>(1.0, 0.0, -1.0, 0.0);
+    }
+    let size = vec2<i32>(textureDimensions(t_ao));
+    let z = (camera.view_proj * vec4<f32>(world, 1.0)).w;
+    let tol = 0.03 + 0.01 * z;
+    let px = vec2<i32>(frag);
+    var best = vec4<f32>(1.0, 0.0, -1.0, 0.0);
+    var best_d = tol;
+    for (var k = 0; k < 5; k = k + 1) {
+        var o = vec2<i32>(0, 0);
+        switch k {
+            case 1: { o = vec2<i32>(1, 0); }
+            case 2: { o = vec2<i32>(-1, 0); }
+            case 3: { o = vec2<i32>(0, 1); }
+            case 4: { o = vec2<i32>(0, -1); }
+            default: {}
+        }
+        let s = textureLoad(t_ao, clamp(px + o, vec2<i32>(0), size - vec2<i32>(1)), 0);
+        let d = abs(s.g - z);
+        if (s.g > 0.0 && d < best_d) {
+            best_d = d;
+            best = vec4<f32>(s.r, s.g, s.b, 1.0);
+        }
+        if (k == 0 && d < tol * 0.3) {
+            break;
+        }
+    }
+    return best;
+}
+
 // The ambient occlusion at a pixel of the full picture. It is worked out at half size, and
 // a plain bilinear lookup blended the occlusion of the ground behind an edge with that of
 // the object in front: every wheel, pole and kerb stood in a pale outline on the shaded
 // ground under the bus. Of the four half-size texels around the pixel only those at the
 // pixel's own depth count (a depth-aware upsample); none of them: the closest in depth.
 fn ao_at(frag: vec2<f32>, world: vec3<f32>) -> f32 {
+    if (camera.clouds.w > 1.5) {
+        let t = rt_at(frag, world);
+        return select(t.x, 1.0, t.w < 0.5);
+    }
     let size = vec2<i32>(textureDimensions(t_ao));
     let z = (camera.view_proj * vec4<f32>(world, 1.0)).w;
     let f = frag * 0.5 - vec2<f32>(0.5);
@@ -275,6 +322,11 @@ struct PointLight {
 // per cell CELL_CAP light indices, 0xffffffff = empty
 @group(0) @binding(4) var<storage, read> grid: array<u32>;
 const CELL_CAP: u32 = 32u;
+// The cutout of `[matl_alpha] 1`: Omsi.exe sets ALPHAREF 0x80 with ALPHAFUNC GREATER, so a
+// texel of alpha 128 is thrown away. Painters' window layers (a bus's glass unwrapped on its
+// own texture to draw on) mark the clear glass with exactly 128: cut below one half, those
+// texels stayed and every window was the layer's black.
+const ALPHA_REF: f32 = 128.5 / 255.0;
 
 @group(1) @binding(0) var t_diffuse: texture_2d<f32>;
 @group(1) @binding(1) var s_diffuse: sampler;
@@ -300,6 +352,10 @@ struct MaterialParams {
     flags: vec4<f32>,
     // rgb: the D3D material's ambient colour, which takes the ambient light (C)
     ambient: vec4<f32>,
+    // Windy trees: x 1 for foliage that sways, y the height (mesh units) of its pivot - where
+    // the crown leaves the trunk, nothing below it moves - z the crown's top, w how much the
+    // tree gives to the wind (1 a broadleaf, less a conifer)
+    sway: vec4<f32>,
 };
 @group(1) @binding(2) var<uniform> material: MaterialParams;
 @group(1) @binding(3) var t_trans: texture_2d<f32>;
@@ -482,11 +538,90 @@ fn vertex_specular(wp: vec3<f32>, n: vec3<f32>) -> array<vec3<f32>, 2> {
     return out;
 }
 
+// Windy trees: how far the wind moves a vertex of a tree's foliage (world, m). `local` is
+// the vertex in the mesh, `m` its model matrix, whose origin is the tree's foot.
+//
+// The tree is bent, not shifted: nothing under its pivot (`material.sway.y`, where the crown
+// leaves the trunk) moves, and above it the crown bends over as a cantilever does, by the
+// square of the height above the pivot, sinking a little so that its branches keep their
+// length. The crown moves as one heavy body - a tree is a lightly damped oscillator, and
+// what it does is smooth: no part of the picture moves on its own (each corner of a card
+// wobbling in its own phase made the crown jelly).
+//
+// What bends it is the drag of the air: it grows with the wind speed to the power 1.5 rather
+// than 2, as a crown streamlines itself (Vogel's reconfiguration exponent), from a few
+// millimetres at 1 m/s to some 3.5 % of the tree's height at 20 m/s, a storm. The gusts are
+// a frozen pattern of faster and slower air carried along at the mean wind (Taylor): three
+// smooth waves 54 .. 149 m long, a turbulence intensity of 0.3 as over a town, so that
+// neighbouring trees bow together as a gust passes and the ones further on follow - and,
+// being smooth, the gusts never stop the tree dead as the corners of a value noise did.
+// Around that lean the tree swings at its own natural frequency (0.2 .. 1 Hz, lower the
+// taller it is), its amplitude and phase wandering slowly as a resonance driven by
+// turbulence does, and a little across the wind; the crown's top lags its middle a little.
+// With no wind nothing moves.
+fn tree_sway(local: vec3<f32>, m: mat4x4<f32>) -> vec3<f32> {
+    let sw = material.sway;
+    let wind = camera.tree_wind.xy;
+    let speed = length(wind);
+    if (sw.x < 0.5 || speed < 0.05) {
+        return vec3<f32>(0.0);
+    }
+    let h = clamp((local.z - sw.y) / max(sw.z - sw.y, 1e-4), 0.0, 1.0);
+    if (h <= 0.0) {
+        return vec3<f32>(0.0);
+    }
+    let scale = length(m[2].xyz);
+    let crown = max((sw.z - sw.y) * scale, 0.1);
+    let height = max(sw.z * scale, crown);
+    let foot = (m * vec4<f32>(0.0, 0.0, 0.0, 1.0)).xyz;
+    let foot_map = world_pattern_xy(foot);
+    let t = camera.post.y;
+    // each tree its own phase
+    let seed = hash_cell(floor(foot_map * 2.0), 2000.0);
+    let phase = seed * 6.2831853;
+    // the gusts at the tree: whole waves per PATTERN_PERIOD (the map position and the
+    // drift arrive modulo it), 149, 93 and 54 m long - a gust lasts some seconds; their sum has a standard deviation of
+    // 0.51 (0.6, 0.35, 0.2 over sqrt 2), scaled to the turbulence intensity 0.3
+    let gp = (foot_map - camera.tree_wind.zw) * (6.2831853 / PATTERN_PERIOD);
+    let waves = 0.6 * sin(dot(gp, vec2<f32>(6.0, 3.0)) + 1.3)
+        + 0.35 * sin(dot(gp, vec2<f32>(-4.0, 10.0)) + 4.1)
+        + 0.2 * sin(dot(gp, vec2<f32>(17.0, -7.0)) + 2.2);
+    let gust = max(1.0 + 0.59 * waves, 0.0);
+    let along = wind / speed;
+    let across = vec2<f32>(-along.y, along.x);
+    // the lean under the gusting wind, and the tree's swing about it
+    let give = 0.035 * height * sw.w;
+    let lean = give * pow(speed * gust / 20.0, 1.5);
+    // (in strong wind the swing is of the order of the mean lean itself)
+    let swing_size = 0.7 * give * pow(speed / 20.0, 1.5);
+    let f0 = clamp(1.6 / sqrt(height), 0.2, 1.0);
+    let w0 = 6.2831853 * f0 * t + phase + 0.8 * sin(0.17 * t + 9.0 * seed);
+    let envelope = 0.65 + 0.35 * sin(0.23 * t + 5.0 * seed);
+    let swing = swing_size * envelope;
+    // (the top lags the middle by a fraction of a cycle: the crown bends, not only leans)
+    let lag = 0.35 * h;
+    let move_xy = along * (lean + swing * sin(w0 - lag)) + across * (0.35 * swing * sin(0.93 * w0 + 1.7 - lag));
+    var d = vec3<f32>(move_xy * h * h, 0.0);
+    // the crown's big boughs: lobes about the crown's size swaying at about twice the tree's
+    // frequency, each with its own slowly wandering phase, harder in a gust - neighbouring
+    // parts of the picture move nearly together, so the crown stirs rather than wobbles
+    let lm = (m * vec4<f32>(local, 0.0)).xyz;
+    let bp = dot(lm, vec3<f32>(0.45, 0.35, 0.3) * (4.0 / crown)) + phase;
+    let fb = clamp(2.2 * f0, 0.8, 2.0);
+    let wb = 6.2831853 * fb * t + bp + 0.6 * sin(0.31 * t + bp);
+    let bough = 0.25 * give * pow(speed * gust / 20.0, 1.5) * h;
+    d = d + vec3<f32>(along * sin(wb) + across * 0.5 * sin(1.17 * wb + 2.0), 0.25 * sin(0.9 * wb + 1.0)) * bough;
+    // the bent crown keeps its length: it sinks as it leans
+    let above = max((local.z - sw.y) * scale, 0.3);
+    d.z = d.z - 0.5 * dot(d.xy, d.xy) / above;
+    return d;
+}
+
 @vertex
 fn vs_main(in: VsIn) -> VsOut {
     let e = draw_list[in.inst];
     let m = model_matrix(e);
-    let wp = m * vec4<f32>(in.pos, 1.0);
+    let wp = m * vec4<f32>(in.pos, 1.0) + vec4<f32>(tree_sway(in.pos, m), 0.0);
     var out: VsOut;
     // Road surfaces (splines, the objects lying on them, a shadow blob) are pulled towards
     // the eye along the line of sight - the picture does not move, only the depth - so that
@@ -504,7 +639,11 @@ fn vs_main(in: VsIn) -> VsOut {
         // line of sight bowed the road's long triangles over the short ones of what lies on
         // it, by millimetres near the eye, and the rails went under the road there (#1196).
         // (surface objects, 1.25, a little more than the splines under them)
-        let decal = select(0.0, 0.01 + 0.001 * d, surf > 1.1 && surf < 1.5);
+        // (a vehicle's shadow blob, 2: drawn without a depth test in the original, right
+        // over the road it lies on - with the road's own pull alone the two fought for
+        // every pixel and the road mostly won; a few centimetres more bring it through the
+        // road and still leave it behind the body and the wheels standing on it)
+        let decal = select(select(0.0, 0.01 + 0.001 * d, surf > 1.1 && surf < 1.5), 0.05 + 0.002 * d, surf > 1.5);
         let pull = min(0.003 * d + decal, d * 0.3);
         cp = wp.xyz - to / max(d, 1e-3) * pull;
     }
@@ -587,7 +726,7 @@ fn shadow_caster_pos(e: u32, wp: vec4<f32>) -> vec4<f32> {
 fn vs_shadow(in: VsIn) -> VsOut {
     let e = draw_list[in.inst];
     let m = model_matrix(e);
-    let wp = shadow_caster_pos(e, m * vec4<f32>(in.pos, 1.0));
+    let wp = shadow_caster_pos(e, m * vec4<f32>(in.pos, 1.0) + vec4<f32>(tree_sway(in.pos, m), 0.0));
     var out: VsOut;
     out.clip = camera.light_view_proj * wp;
     out.world = wp.xyz;
@@ -608,7 +747,7 @@ fn vs_shadow(in: VsIn) -> VsOut {
 fn vs_shadow_close(in: VsIn) -> VsOut {
     let e = draw_list[in.inst];
     let m = model_matrix(e);
-    let wp = shadow_caster_pos(e, m * vec4<f32>(in.pos, 1.0));
+    let wp = shadow_caster_pos(e, m * vec4<f32>(in.pos, 1.0) + vec4<f32>(tree_sway(in.pos, m), 0.0));
     var out: VsOut;
     out.clip = camera.light_view_proj_close * wp;
     out.world = wp.xyz;
@@ -629,7 +768,7 @@ fn vs_shadow_close(in: VsIn) -> VsOut {
 fn vs_shadow_far(in: VsIn) -> VsOut {
     let e = draw_list[in.inst];
     let m = model_matrix(e);
-    let wp = shadow_caster_pos(e, m * vec4<f32>(in.pos, 1.0));
+    let wp = shadow_caster_pos(e, m * vec4<f32>(in.pos, 1.0) + vec4<f32>(tree_sway(in.pos, m), 0.0));
     var out: VsOut;
     out.clip = camera.light_view_proj_far * wp;
     out.world = wp.xyz;
@@ -644,6 +783,48 @@ fn vs_shadow_far(in: VsIn) -> VsOut {
         out.clip = vec4<f32>(0.0, 0.0, 2.0, 1.0);
     }
     return out;
+}
+
+// Enhanced: a street lamp's shadow map (one of the tiles under the far map), looking down
+// from its head.
+fn shadow_lamp(in: VsIn, k: u32) -> VsOut {
+    let e = draw_list[in.inst];
+    let m = model_matrix(e);
+    let wp = m * vec4<f32>(in.pos, 1.0) + vec4<f32>(tree_sway(in.pos, m), 0.0);
+    var out: VsOut;
+    out.clip = camera.lamp_view_proj[k] * wp;
+    out.world = wp.xyz;
+    out.normal = in.normal;
+    out.spec_sun = vec3<f32>(0.0);
+    out.spec_sky = vec3<f32>(0.0);
+    let pr = inst_params[e * 2u];
+    out.uv = in.uv + pr.zw;
+    out.params = pr;
+    out.params2 = inst_params[e * 2u + 1u];
+    if (pr.y < 0.5) {
+        out.clip = vec4<f32>(0.0, 0.0, 2.0, 1.0);
+    }
+    return out;
+}
+
+@vertex
+fn vs_shadow_lamp0(in: VsIn) -> VsOut {
+    return shadow_lamp(in, 0u);
+}
+
+@vertex
+fn vs_shadow_lamp1(in: VsIn) -> VsOut {
+    return shadow_lamp(in, 1u);
+}
+
+@vertex
+fn vs_shadow_lamp2(in: VsIn) -> VsOut {
+    return shadow_lamp(in, 2u);
+}
+
+@vertex
+fn vs_shadow_lamp3(in: VsIn) -> VsOut {
+    return shadow_lamp(in, 3u);
 }
 
 @fragment
@@ -689,7 +870,7 @@ fn fs_shadow_test(in: FsIn) {
         let tm = sample_transmap(tex_address(in.uv - in.params.zw));
         a = select(1.0, tm.a, material.params.w > 0.5);
     }
-    if (a < 0.5) {
+    if (a < ALPHA_REF) {
         discard;
     }
 }
@@ -842,13 +1023,19 @@ fn shadow_close(world: vec3<f32>, n: vec3<f32>, ndl: f32, thin: bool) -> vec2<f3
     return vec2<f32>(shadow_pcf_close(uv, lp.z, slope, camera.shadow.y), w);
 }
 
+// The far map takes the top of its texture; the street lamps' tiles lie under it
+// (`FAR_MAP_ASPECT` in lib.rs).
+fn far_map_uv(uv: vec2<f32>) -> vec2<f32> {
+    return vec2<f32>(uv.x, uv.y * 0.8);
+}
+
 fn shadow_pcf_far(uv: vec2<f32>, z: f32, slope: vec2<f32>, texel: f32) -> f32 {
     let bias = SHADOW_BIAS_FAR / SHADOW_DEPTH_RANGE;
     // (corners first, as in `shadow_pcf_atlas`)
     var corners = 0.0;
     for (var k = 0; k < 5; k = k + 1) {
         let o = SHADOW_OFFSETS[SHADOW_CORNERS[k]] * texel * 2.2;
-        corners = corners + textureSampleCompareLevel(t_shadow_far, s_shadow, uv + o, z + dot(slope, o) - bias);
+        corners = corners + textureSampleCompareLevel(t_shadow_far, s_shadow, far_map_uv(uv + o), z + dot(slope, o) - bias);
     }
     if (corners <= 0.0 || corners >= 5.0) {
         return corners * 0.2;
@@ -856,7 +1043,7 @@ fn shadow_pcf_far(uv: vec2<f32>, z: f32, slope: vec2<f32>, texel: f32) -> f32 {
     var sum = corners;
     for (var k = 0; k < 11; k = k + 1) {
         let o = SHADOW_OFFSETS[SHADOW_REST[k]] * texel * 2.2;
-        sum = sum + textureSampleCompareLevel(t_shadow_far, s_shadow, uv + o, z + dot(slope, o) - bias);
+        sum = sum + textureSampleCompareLevel(t_shadow_far, s_shadow, far_map_uv(uv + o), z + dot(slope, o) - bias);
     }
     return sum / 16.0;
 }
@@ -1465,7 +1652,10 @@ fn fs_vanilla_reflections(in: FsIn) -> EnhancedOut {
     var weight = 0.0;
     let c = shade_vanilla(in, &weight, camera.cam_pos.xyz);
     let coverage = select(c.a, 0.0, in.params2.w > 1.5);
-    return EnhancedOut(c, vec4<f32>(0.0, weight * 0.49, weight, coverage));
+    var out: EnhancedOut;
+    out.color = c;
+    out.mask = vec4<f32>(0.0, weight * 0.49, weight, coverage);
+    return out;
 }
 
 fn shade_vanilla(in: FsIn, puddle_weight: ptr<function, f32>, eye: vec3<f32>) -> vec4<f32> {
@@ -1523,11 +1713,13 @@ fn shade_vanilla(in: FsIn, puddle_weight: ptr<function, f32>, eye: vec3<f32>) ->
     if (ALPHA_TEST && mode > 0.5 && mode < 1.5) {
         if (ALPHA_TO_COVERAGE) {
             let aa = max(fwidth(tex.a) * 0.5, 1.0 / 255.0);
-            if (tex.a < 0.5 - aa) {
+            // (not `ALPHA_REF - aa`: a layer whose clear glass is alpha 128 kept a third of
+            // its samples there, a moire of the layer's paint over every window)
+            if (tex.a < ALPHA_REF) {
                 discard;
             }
-            tex.a = smoothstep(0.5 - aa, 0.5 + aa, tex.a);
-        } else if (tex.a < 0.5) {
+            tex.a = smoothstep(ALPHA_REF - aa, ALPHA_REF + aa, tex.a);
+        } else if (tex.a < ALPHA_REF) {
             discard;
         }
     }
@@ -1739,9 +1931,11 @@ fn shade_vanilla(in: FsIn, puddle_weight: ptr<function, f32>, eye: vec3<f32>) ->
     if (snow > 0.0) {
         let up = clamp(n.z, 0.0, 1.0);
         let ground = select(0.0, 1.0, material.extra.x > 0.5 || material.params2.z > 0.0);
+        // (a road kept clear - "snow on road" off - stays asphalt, #1362)
+        let cleared = select(1.0, 0.0, camera.post.z > 0.5 && material.extra.x < 0.5 && material.params2.z > 0.0);
         // only surfaces that really face up get a cover; a soft threshold keeps the snow
         // off the sides and off the grazing rims that showed as a white outline
-        let cover = snow * clamp(max(ground, smoothstep(0.78, 0.95, up) * 0.8), 0.0, 1.0);
+        let cover = cleared * snow * clamp(max(ground, smoothstep(0.78, 0.95, up) * 0.8), 0.0, 1.0);
         let light = camera.sun_color.rgb * camera.sun_dir.w * ndl * shadow * 0.6 + camera.sky_color.rgb * 0.7 + camera.ambient.xyz;
         let white = vec3<f32>(0.92, 0.94, 0.98) * light * ao;
         lit = mix(lit, white, cover * (0.55 + 0.35 * tex.a));

@@ -122,6 +122,15 @@ pub(crate) fn content_dir() -> Option<PathBuf> {
     }
 }
 
+/// Where a save goes when the content folder takes none (`~/.openomsi/content`): a game
+/// unpacked into Program Files, or a folder Windows' controlled folder access guards, said
+/// "Could not save: access is denied (os error 5)" (#1673). The launcher lists the saves
+/// there as well.
+pub(crate) fn save_fallback_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    Some(PathBuf::from(home).join(".openomsi").join("content"))
+}
+
 /// Where the last working installation was remembered.
 pub(crate) fn root_memo() -> Option<PathBuf> {
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
@@ -377,6 +386,9 @@ pub(crate) fn window_icon() -> Option<winit::window::Icon> {
 
 /// Enhanced graphics wanted (from the settings, `--enhanced`, or OMSI_ENHANCED=1).
 pub(crate) static ENHANCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Enhanced+ (ray tracing) asked for by `--enhanced-plus` or OMSI_ENHANCED_PLUS=1 whatever
+/// the settings say (see `Settings::render_options`).
+pub(crate) static ENHANCED_PLUS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Vanilla graphics: the picture as OMSI 2 draws it (no Vanilla+ extras, see
 /// `omsi_render::Lighting::classic`).
 pub(crate) static CLASSIC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

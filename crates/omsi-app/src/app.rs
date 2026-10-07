@@ -52,6 +52,8 @@ pub(crate) struct App {
     pub(crate) ui: Option<ui::Ui>,
     pub(crate) fps: f32,
     pub(crate) rain: rain::Rain,
+    /// The player's bus's cabin air and the condensation on its glass.
+    pub(crate) cabin_air: crate::condensation::CabinAir,
     /// What the tyres throw up from the water on the roads (see `puddles`).
     pub(crate) spray: puddles::Spray,
     pub(crate) lamps_on: Option<bool>,
@@ -106,6 +108,8 @@ pub(crate) struct App {
     pub(crate) mouse_look: bool,
     /// The left and right mouse buttons held.
     pub(crate) buttons_held: (bool, bool),
+    /// The middle button held (looks round; the right button zooms).
+    pub(crate) mmb_held: bool,
     /// The right button (or both) held: OMSI's mouse zoom (0x82c5f8) - moving the mouse up
     /// widens the view in the bus or takes the outside camera further away, by the value at
     /// the press over 500 pixels: (the cursor's height then, the zoom or distance then).
@@ -158,10 +162,20 @@ pub(crate) struct App {
     pub(crate) menu_kbd: bool,
     /// Keys pressed (true) and let go since the Lua plugins' last frame.
     pub(crate) plugin_keys: Vec<(String, bool)>,
+    /// What happened since the Lua plugins' last frame: crashes, people knocked down,
+    /// stops skipped (see `plugins::queue_event`).
+    pub(crate) plugin_events: Vec<omsi_plugin::GameEvent>,
     /// Seconds Ctrl+Shift+Page Up/Down has been held (the clock runs faster the longer).
     pub(crate) clock_hold: f32,
+    /// How far the clock was set since the timetable was last put out again (s; see
+    /// `shift_clock`).
+    pub(crate) clock_jump: f64,
+    /// The bus whose seat (`settings::bus_seats`) `settings.seat` holds now.
+    pub(crate) seat_bus: String,
     /// A controller button held for looking left, right, up, down (`view_look_*`).
     pub(crate) pad_look: [bool; 4],
+    /// A controller button held for the multiplayer bus radio (`voice_radio`).
+    pub(crate) pad_voice_radio: bool,
     /// The arrow keys turned the head (a glance that comes back when they are let go).
     pub(crate) arrow_glance: bool,
     /// The next click on the city map puts the bus there (Esc → Move the bus on the map).
@@ -206,6 +220,10 @@ pub(crate) struct App {
     pub(crate) mouse_pedals: (f32, f32),
     /// The speed mouse steering divides by, smoothed.
     pub(crate) mouse_kmh: f32,
+    /// The speed a gamepad stick's steering divides by, smoothed (as `mouse_kmh`).
+    pub(crate) pad_kmh: f32,
+    /// Where a gamepad stick turns the wheel to, smoothed (`pad_steer_smooth`).
+    pub(crate) pad_steer_target: f32,
     /// The tutorial being run (`--tutorial`), loaded on the first frame.
     pub(crate) tutorial: Option<crate::tutorial::Tutorial>,
     /// OMSI's pedestrian ("ego") view: the free camera walking at eye height on whatever
@@ -249,6 +267,9 @@ pub(crate) struct App {
     pub(crate) own_keys: std::collections::HashSet<i32>,
     /// The same for keys held with Shift (a Shift+number of the player's own is not a door key).
     pub(crate) own_shift: std::collections::HashSet<i32>,
+    /// A binding chosen in the pause menu that is waiting for the next physical key:
+    /// (true: [game], false: [vehicles], index in that section).
+    pub(crate) key_capture: Option<(bool, usize)>,
     /// Whether the game stood paused before the menu opened (closing it goes back to that).
     pub(crate) menu_prev_pause: bool,
     /// OMSI's information bar (`view_toggle_informationdisplay`, Ctrl+Y): time, speed, the
@@ -683,6 +704,7 @@ impl App {
                         paint: o.paint.clone(),
                         situation_vars: o.vars.clone(),
                         situation_strvars: o.strvars.clone(),
+                        situation_odometer_km: o.odometer_km,
                         situation_others: Vec::new(),
                         line: None,
                         tour: None,
@@ -751,6 +773,7 @@ impl App {
                     match traffic::Traffic::new(&self.args.root, &w, self.args.traffic) {
                         Ok(mut t) => {
                             t.lights_only = !populated;
+                            t.no_timetable_buses = self.args.no_timetable_buses;
                             if let Some(lan) = self.lan.as_ref() {
                                 t.set_lan_seed(lan::population_seed(lan));
                             }
@@ -1002,17 +1025,23 @@ impl App {
             Some(Instant::now() + std::time::Duration::from_millis(2)),
         );
         w.update_texture_budget(r, scene, &centers, false);
-        if centers.is_empty()
-            || !streamer.update(
+        if centers.is_empty() {
+            return;
+        }
+        let changed = streamer.update(
             r,
             scene,
             &centers,
             std::time::Duration::from_millis(6),
             self.audio.as_ref(),
-        )
-        {
+        );
+        // Uploads can temporarily exceed the texture budget before the next frame's
+        // housekeeping pass. Recheck immediately after streaming so far textures are
+        // reduced before the renderer allocates more frame resources.
+        if !changed {
             return;
         }
+        w.update_texture_budget(r, scene, &centers, true);
         if let Some(p) = self.player.as_mut() {
             // (OMSI's [no_collision]: no solid object stops the bus)
             p.vehicle.collision = self.settings.collision_objects.then(|| w.collision.lock().clone());
